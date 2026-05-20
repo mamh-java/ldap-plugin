@@ -458,10 +458,10 @@ public class LDAPConfiguration extends AbstractDescribableImpl<LDAPConfiguration
                 props.put(Context.INITIAL_CONTEXT_FACTORY, "com.sun.jndi.ldap.LdapCtxFactory");
                 props.put(Context.PROVIDER_URL, LDAPSecurityRealm.toProviderUrl(server,rootDN));
 
-                props.put("java.naming.referral", "follow");
                 props.put("com.sun.jndi.ldap.connect.timeout", Integer.toString(CONNECT_TIMEOUT));
                 props.put("com.sun.jndi.ldap.connect.pool", "true");
                 props.put("com.sun.jndi.ldap.read.timeout", Integer.toString(READ_TIMEOUT));
+                props.put("java.naming.referral", "ignore"); // SECURITY-3654
 
                 ctx = new InitialDirContext(props);
                 return FormValidation.ok();   // connected
@@ -650,11 +650,11 @@ public class LDAPConfiguration extends AbstractDescribableImpl<LDAPConfiguration
             contextSource.setUserDn(getManagerDN());
             contextSource.setPassword(getManagerPassword());
         }
-        contextSource.setReferral("follow");
         Map<String, Object> vars = new HashMap<>();
         vars.put("com.sun.jndi.ldap.connect.pool", "true");
         vars.put("com.sun.jndi.ldap.connect.timeout", Integer.toString(CONNECT_TIMEOUT)); // timeout if no connection after 30 seconds
         vars.put("com.sun.jndi.ldap.read.timeout", Integer.toString(READ_TIMEOUT)); // timeout if no response after 60 seconds
+        vars.put("java.naming.referral", "ignore"); // SECURITY-3654
         vars.putAll(getExtraEnvVars());
         contextSource.setBaseEnvironmentProperties(vars);
         contextSource.afterPropertiesSet();
