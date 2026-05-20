@@ -35,10 +35,18 @@ import hudson.tasks.Mailer;
 import hudson.util.FormValidation;
 import hudson.util.Secret;
 
+import java.io.IOException;
+import java.net.ServerSocket;
+import java.net.Socket;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.logging.Level;
 import java.util.stream.Collectors;
+import javax.naming.Context;
+import javax.naming.directory.BasicAttribute;
+import javax.naming.directory.BasicAttributes;
+import javax.naming.directory.DirContext;
+import javax.naming.directory.InitialDirContext;
 
 import jenkins.model.IdStrategy;
 import jenkins.security.SecurityListener;
@@ -769,4 +777,123 @@ class LDAPEmbeddedTest {
         assertThrows(AccountExpiredException.class, () -> User.getById("bender", true).impersonate2());
         assertThrows(FailingHttpStatusCodeException.class, () -> r.createWebClient().withBasicApiToken("amy").goTo(""));
     }
+
+    /**
+     * Adds a referral entry to the embedded LDAP that points to the given host:port.
+     * This simulates a malicious referral that could redirect the JNDI client
+     * to an attacker-controlled server.
+     */
+    private void addReferralEntry(String rogueUrl) throws Exception {
+        Hashtable<String, Object> adminEnv = new Hashtable<>();
+        adminEnv.put(Context.INITIAL_CONTEXT_FACTORY, "com.sun.jndi.ldap.LdapCtxFactory");
+        adminEnv.put(Context.PROVIDER_URL, ads.getUrl() + "/dc=planetexpress,dc=com");
+        adminEnv.put(Context.SECURITY_PRINCIPAL, "uid=admin,ou=system");
+        adminEnv.put(Context.SECURITY_CREDENTIALS, "pass");
+        adminEnv.put(Context.REFERRAL, "ignore");
+        DirContext adminCtx = new InitialDirContext(adminEnv);
+        try {
+            BasicAttributes attrs = new BasicAttributes(true);
+            BasicAttribute oc = new BasicAttribute("objectClass");
+            oc.add("top");
+            oc.add("referral");
+            oc.add("extensibleObject");
+            attrs.put(oc);
+            attrs.put("ou", "rogue");
+            attrs.put("ref", rogueUrl);
+            adminCtx.createSubcontext("ou=rogue", attrs);
+        } finally {
+            adminCtx.close();
+        }
+    }
+
+    @Test
+    @Issue("SECURITY-3654")
+    @LDAPSchema(ldif = "planetexpress", id = "planetexpress", dn = "dc=planetexpress,dc=com")
+    void referralFollowingDisabledByDefault() throws Exception {
+        try (ServerSocket rogueServer = new ServerSocket(0)) {
+            rogueServer.setSoTimeout(5000);
+            int roguePort = rogueServer.getLocalPort();
+
+            // Add a referral entry pointing to the rogue server (simulates attacker-injected referral)
+            addReferralEntry("ldap://localhost:" + roguePort + "/dc=evil,dc=com");
+
+            // Accept connections in background to detect if the JNDI client follows the referral
+            AtomicBoolean connectionAttempted = new AtomicBoolean(false);
+            Thread acceptor = new Thread(() -> {
+                try (Socket s = rogueServer.accept()) {
+                    connectionAttempted.set(true);
+                } catch (IOException ignored) {
+                    // SocketTimeoutException expected - no connection was made
+                }
+            });
+            acceptor.setDaemon(true);
+            acceptor.start();
+
+            // Configure realm WITHOUT referral=follow (the security fix)
+            LDAPConfiguration c = new LDAPConfiguration(
+                ads.getUrl(), "", false, "uid=admin,ou=system", Secret.fromString("pass"));
+            LDAPSecurityRealm realm = new LDAPSecurityRealm(
+                Collections.singletonList(c), false,
+                new LDAPSecurityRealm.CacheConfiguration(100, 1000),
+                IdStrategy.CASE_INSENSITIVE, IdStrategy.CASE_INSENSITIVE);
+            r.jenkins.setSecurityRealm(realm);
+
+            // Authenticate - should succeed without following referrals
+            realm.authenticate2("fry", "fry");
+
+            // Wait for the accept thread to time out
+            acceptor.join(6000);
+
+            // The rogue server must NOT have received a connection
+            assertThat("Rogue server must NOT receive a connection when referral following is disabled (SECURITY-3654)",
+                connectionAttempted.get(), is(false));
+        }
+    }
+
+    @Test
+    @Issue("SECURITY-3654")
+    @LDAPSchema(ldif = "planetexpress", id = "planetexpress", dn = "dc=planetexpress,dc=com")
+    void referralFollowingEnabledViaEnvironmentProperties() throws Exception {
+        try (ServerSocket rogueServer = new ServerSocket(0)) {
+            rogueServer.setSoTimeout(5000);
+            int roguePort = rogueServer.getLocalPort();
+
+            addReferralEntry("ldap://localhost:" + roguePort + "/dc=evil,dc=com");
+
+            AtomicBoolean connectionAttempted = new AtomicBoolean(false);
+            Thread acceptor = new Thread(() -> {
+                try (Socket s = rogueServer.accept()) {
+                    connectionAttempted.set(true);
+                } catch (IOException ignored) {
+                }
+            });
+            acceptor.setDaemon(true);
+            acceptor.start();
+
+            LDAPConfiguration c = new LDAPConfiguration(
+                ads.getUrl(), "", false, "uid=admin,ou=system", Secret.fromString("pass"));
+            LDAPSecurityRealm.EnvironmentProperty[] environmentProperties = {
+                new LDAPSecurityRealm.EnvironmentProperty("java.naming.referral", "follow")
+            };
+            c.setEnvironmentProperties(environmentProperties);
+            LDAPSecurityRealm realm = new LDAPSecurityRealm(
+                Collections.singletonList(c), false,
+                new LDAPSecurityRealm.CacheConfiguration(100, 1000),
+                IdStrategy.CASE_INSENSITIVE, IdStrategy.CASE_INSENSITIVE);
+            r.jenkins.setSecurityRealm(realm);
+
+            try {
+                realm.authenticate2("fry", "fry");
+            } catch (Exception e) {
+                // Authentication may fail because the rogue server doesn't speak LDAP,
+                // but we only care whether the connection was attempted
+            }
+
+            acceptor.join(6000);
+
+            assertThat("Rogue server MUST receive a connection when referral following is enabled via environment properties",
+                connectionAttempted.get(), is(true));
+        }
+    }
+
 }
